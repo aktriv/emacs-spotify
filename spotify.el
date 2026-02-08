@@ -1,4 +1,4 @@
-;;; spotify.el --- Control Spotify from within Emacs -*- lexical-binding: t -*-
+;;; spotify.el --- Control Spotify interactively -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2020-2023 Akshay Trivedi
 
@@ -27,8 +27,8 @@
 
 ;;; Commentary:
 
-;;;; Small package for controlling Spotify interactively from within Emacs
-;;;; using the Spotify Web API.
+;;;; Small package for controlling Spotify interactively using the Spotify Web
+;;;; API.
 
 ;;; Code:
 
@@ -60,7 +60,7 @@ Set to nil to disable the default Emacs Spotify keymaps."
   "Options for configuring the logging system."
   :group 'spotify)
 
-(defcustom spotify-enable-logging nil
+(defcustom spotify-enable-logging t
   "Non-nil if the logging system should be enabled."
   :type 'boolean
   :group 'spotify-log)
@@ -94,6 +94,8 @@ handful of ports will actually work.  If you want to choose a different port,
 please contact me by submitting an issue to GitHub, since it's pretty easy for
 me to add new alternative ports."
   :type '(choice (const 80)
+                 (const 3000)
+                 (const 5000)
                  (const 8000)
                  (const 8080)
                  (const 8888)
@@ -146,7 +148,7 @@ on your machine, these permissions are not accessible to anyone except yourself.
 (defvar spotify--auth-status 'unauthorized
   "Enum representing the authorization status.
 
- - authorized: The user hasn't started the authorization process yet.
+ - unauthorized: The user hasn't started the authorization process yet.
  - authorizing: The user has been prompted to login, awaiting a response.
  - authorized: The user has authorized Emacs Spotify, access token available.")
 
@@ -173,6 +175,15 @@ Represented as an symbol-to-value alist:
 
 Runs on a periodic interval determined by `spotify-token-refresher-interval'.")
 
+(defvar-local spotify--search-query-widget nil
+  "The widget containing the query in a search buffer.")
+
+(defvar-local spotify--search-types-widget nil
+  "The widget containing the selected item types in a search buffer.")
+
+(defvar-local spotify--search-results-widget nil
+  "The widget containing the results in a search buffer.")
+
 ;;;; Utility Functions
 
 (defun spotify--random-char (charset)
@@ -189,15 +200,14 @@ Runs on a periodic interval determined by `spotify-token-refresher-interval'.")
 
 The message that will be logged is the concatenation of `spotify-log-prefix'
 formatted with `format-time-string' and `format` applied to MESSAGE and ARGS.
-
+n
 If `spotify-enable-logging' is nil, nothing will happen."
   (when spotify-enable-logging
     (with-current-buffer (get-buffer-create spotify-log-buffer-name)
       (goto-char (point-max))
       (insert
-       (format-time-string spotify-log-prefix)
-       (apply #'format message args)
-       "\n"))))
+       (propertize (format-time-string spotify-log-prefix) 'face 'bold)
+       (apply #'format message args)))))
 
 (defun spotify--format-url (endpoint &optional query-string)
   "Build a formatted HTTPS URL given an ENDPOINT and a QUERY-STRING.
@@ -249,6 +259,8 @@ The following function call and cURL command are equivalent:
   (let ((url-request-method        (plist-get args :method))
         (url-request-extra-headers (cons '("Content-Type" . "application/x-www-form-urlencoded")
                                          (plist-get args :headers)))
+        (url-request-data          (when (plist-member args :data)
+                                     (url-build-query-string (plist-get args :data))))
         (full-url                  (spotify--format-url
                                     endpoint
                                     (plist-get args :params))))
@@ -262,11 +274,11 @@ The following function call and cURL command are equivalent:
                   (lambda (_)
 		    (let ((response (spotify--parse-http-response)))
 		      (map-let (content status) response
-			       (spotify--log
-				"Retrieved HTTP response from \"%s\"\n - status: %s\n%s\n"
-				args
-				status
-				content))
+			(spotify--log
+			 "Received HTTP response from \"%s\"\n - status: %s\n%s\n"
+			 endpoint
+			 status
+			 content))
 		      (when callback
 			(funcall callback response))))
                   nil
@@ -293,17 +305,17 @@ See docs for `url-retrieve' for how ENDPOINT and ARGS work."
     (let ((response (with-current-buffer (url-retrieve-synchronously full-url t t)
 		      (spotify--parse-http-response))))
       (map-let (content status) response
-	       (spotify--log "Retrieved HTTP response from \"%s\"\n - status: %d\n%s\n"
-			     endpoint
-			     status
-			     content))
+	(spotify--log "Received HTTP response from \"%s\"\n - status: %d\n%s\n"
+		      endpoint
+		      status
+		      content))
       response)))
 
 (defun spotify--token-headers ()
   "Create the necessary headers to perform an API request with an access token."
   (if spotify--access-token
       (list (cons "Authorization" (concat "Bearer " spotify--access-token)))
-    (signal 'spotify--error '("token is nil, run `start-spotify' first"))))
+    (signal 'spotify--error '("Access token is nil; run `start-spotify' first."))))
 
 ;;;; Authorization Functions
 
@@ -348,45 +360,45 @@ Initialize access token using info from REDIRECT-DATA if possible.
 Return an HTML response after processing the data."
   (let (body (head ""))
     (map-let (state) spotify--auth-challenge
-	     (map-let (("code" code) ("error" err) ("state" in-state)) redirect-data
-		      (cond ((not (string= state (car in-state)))
-			     (setq body (format "<h1>Error</h1><p>State mismatch: \"%s\" vs. \"%s\"</p>"
-						state
-						in-state)))
-			    ((car err)
-			     (setq body (format "<h1>Error</h1><p>%s</p>" (car err))))
-			    ((car code)
-			     (spotify--log "Requesting a new access token...\n")
-			     (map-let (code-verifier redirect-uri) spotify--auth-challenge
-				      (let ((response (spotify--fetch "accounts.spotify.com/api/token"
-								      :method "POST"
-								      :data `((grant_type    authorization_code)
-									      (code          ,(car code))
-									      (redirect_uri  ,redirect-uri)
-									      (client_id     ,spotify--client-id)
-									      (code_verifier ,code-verifier)))))
-					(map-let (content) response
-						 (map-let (("error" err) ("error_description" err_desc)) content
-							  (if err
-							      (progn
-								(setq body (format "<h1>Error</h1><p>%s</p>" err_desc))
-								(spotify--log "Request access token: error: %s: %s\n" err err_desc))
-							    (spotify--log "Request access token: success!\n")
-							    (setq spotify--auth-status 'authorized)
-							    (spotify--delete-auth-redirect-process)
-							    (spotify--set-token content)
-							    (spotify--init-token-refresher)
-							    (setq body
-								  (concat
-								   "<h1>Success!</h1>"
-								   "<p>You may now return to Emacs. "
-								   "Check the logs if you have any issues.</p>"))
-							    (when spotify-close-page-on-auth-redirect
-							      (setq head "<script>window.close()</script>"))
-							    (when spotify-focus-on-auth-redirect
-							      (x-focus-frame nil))))))))
-			    (t
-			     (setq body "<h1>Error</h1><p>No <code>code</code> in redirect.</p>")))))
+      (map-let (("code" code) ("error" err) ("state" in-state)) redirect-data
+	(cond ((not (string= state (car in-state)))
+	       (setq body (format "<h1>Error</h1><p>State mismatch: \"%s\" vs. \"%s\"</p>"
+				  state
+				  in-state)))
+	      ((car err)
+	       (setq body (format "<h1>Error</h1><p>%s</p>" (car err))))
+	      ((car code)
+	       (spotify--log "Requesting a new access token...\n")
+	       (map-let (code-verifier redirect-uri) spotify--auth-challenge
+		 (let ((response (spotify--fetch "accounts.spotify.com/api/token"
+						 :method "POST"
+						 :data `((grant_type    authorization_code)
+							 (code          ,(car code))
+							 (redirect_uri  ,redirect-uri)
+							 (client_id     ,spotify--client-id)
+							 (code_verifier ,code-verifier)))))
+		   (map-let (content) response
+		     (map-let (("error" err) error_description) content
+		       (if err
+			   (progn
+			     (setq body (format "<h1>Error</h1><p>%s</p>" error_description))
+			     (spotify--log "Failed to request access token: %s: %s\n" err error_description))
+			 (spotify--log "Successfully obtained access token!\n")
+			 (setq spotify--auth-status 'authorized)
+			 (spotify--delete-auth-redirect-process)
+			 (spotify--set-token content)
+			 (spotify--init-token-refresher)
+			 (setq body
+			       (concat
+				"<h1>Success!</h1>"
+				"<p>You may now return to Emacs. "
+				"Check the logs if you have any issues.</p>"))
+			 (when spotify-close-page-on-auth-redirect
+			   (setq head "<script>window.close()</script>"))
+			 (when spotify-focus-on-auth-redirect
+			   (x-focus-frame nil))))))))
+	      (t
+	       (setq body "<h1>Error</h1><p>No <code>code</code> in redirect.</p>")))))
     (concat "<!DOCTYPE html>"
 	    "<html>"
 	    "<head><title>Emacs Spotify</title>" head "</head>"
@@ -448,12 +460,12 @@ both use the same response format."
   (map-let (("access_token" access-token)
             ("expires_in" expires-in)
             ("refresh_token" refresh-token)) data
-	    (when (>= spotify-token-refresher-interval expires-in)
-	      (spotify--log "Warning: `spotify-token-refresher-interval' is %ds, but token expires in %ds\n"
-			    spotify-token-refresher-interval
-			    expires-in))
-	    (setq spotify--access-token access-token
-		  spotify--refresh-token refresh-token)))
+    (when (>= spotify-token-refresher-interval expires-in)
+      (spotify--log "Warning: `spotify-token-refresher-interval' is %ds, but token expires in %ds\n"
+		    spotify-token-refresher-interval
+		    expires-in))
+    (setq spotify--access-token access-token
+	  spotify--refresh-token refresh-token)))
 
 (defun spotify--refresh-access-token ()
   "Retrieve a new access/refresh token using `spotify--refresh-token'."
@@ -461,15 +473,21 @@ both use the same response format."
   (when spotify--refresh-token
     (spotify--fetch-async "accounts.spotify.com/api/token"
                           (lambda (response)
-                            (map-let (content status) response
-				     (if (and (eq 401 status)
-					      (eq :relog spotify-auth-lost-behavior))
-					 (restart-spotify)
-				       (if-let ((err (gethash "error" content)))
-					   (spotify--log "Refresh access token: error: %s\n"
-							 (gethash "error_description" content))
-					 (spotify--log "Refresh access token: success!\n")
-					 (spotify--set-token content)))))
+                            (map-let (content-type content status) response
+                              (cond ((and (= 401 status)
+		                          (eq :relog spotify-auth-lost-behavior))
+	                             (restart-spotify)
+                                     (signal 'spotify--error "Authorization lost; opening \"Login with Spotify\" page."))
+	                            ((and (eq 'json content-type))
+                                     (map-let (("error" err) error_description) content
+                                       (when err
+                                         (stop-spotify)
+                                         (signal 'spotify--error (list error_description)))))
+                                    ((not <= 200 status 299)
+                                     (stop-spotify)
+                                     (signal 'spotify--api-error '("See logs for more info."))))
+			      (spotify--log "Refresh access token: success!\n")
+			      (spotify--set-token content)))
                           :method "POST"
                           :data `((grant_type    refresh_token)
                                   (refresh_token ,spotify--refresh-token)
@@ -518,6 +536,7 @@ set `spotify-keymap-prefix' to nil and then bind the keys as you see fit.")
                   spotify--keymap)
       map)))
 
+;;;###autoload
 (define-minor-mode spotify-mode
   "Toggle the Emacs Spotify minor mode.
 
@@ -542,15 +561,17 @@ Enable the key bindings in `spotify--keymap'."
 
 Throws error or returns non-nil on failure."
   (map-let (content-type content status) response
-	   (cond ((and (eq 401 status)
-		       (or (eq :relog spotify-auth-lost-behavior)
-			   (eq :relog-interactive spotify-auth-lost-behavior)))
-		  (restart-spotify)
-		  t)
-		 ((eq 'json content-type)
-		  (when-let ((err (gethash "error" content))
-			     (err-message (gethash "message" err)))
-		    (signal 'spotify--api-error (list err-message)))))))
+    (cond ((and (= 401 status)
+		(or (eq :relog spotify-auth-lost-behavior)
+		    (eq :relog-interactive spotify-auth-lost-behavior)))
+	   (restart-spotify)
+           (signal 'spotify--error "Authorization lost; opening \"Login with Spotify\" page."))
+	  ((eq 'json content-type)
+	   (when-let* ((err (gethash "error" content))
+		       (err-message (gethash "message" err)))
+	     (signal 'spotify--api-error (list err-message))))
+          ((not <= 200 status 299)
+           (signal 'spotify--api-error '("See logs for more info."))))))
 
 ;;;; Interactive Functions
 
@@ -558,9 +579,9 @@ Throws error or returns non-nil on failure."
 (defun start-spotify ()
   "Start the Emacs Spotify service and open a login page."
   (interactive)
-  (if (eq spotify--auth-status 'authorized)
-      (signal 'spotify--error '("already running, run `restart-spotify' to reload"))
-    (when (eq spotify--auth-status 'unauthorized)
+  (if (eq 'authorized spotify--auth-status)
+      (signal 'spotify--error '("Already running; run `restart-spotify' to reload."))
+    (when (eq 'unauthorized spotify--auth-status)
       (spotify--log "Starting Emacs Spotify service...\n")
       (setq spotify--auth-status 'authorizing)
       (spotify--init-auth-redirect-process))
@@ -628,17 +649,71 @@ Throws error or returns non-nil on failure."
 (defun spotify-volume (volume-percent)
   "Set the volume for the user's current playback device to VOLUME-PERCENT."
   (interactive "P")
-  (when (not volume-percent)
-    (setq volume-percent (read-number "Volume Percent (0-100): ")))
-  (while (not (<= 0 volume-percent 100))
-    (message "Volume must be a number from 0 to 100.")
-    (sit-for 1)
-    (setq volume-percent (read-number "Volume Percent (0-100): ")))
+  (if volume-percent
+      (if (not (<= 0 volume-percent 100))
+          (signal 'spotify--error '("Volume must be a number from 0 to 100.")))
+    (setq volume-percent (read-number "Volume Percent (0-100): "))
+    (while (not (<= 0 volume-percent 100))
+      (message "Volume must be a number from 0 to 100.")
+      (sit-for 1)
+      (setq volume-percent (read-number "Volume Percent (0-100): "))))
   (let ((response (spotify--fetch "api.spotify.com/v1/me/player/volume"
                                   :method "PUT"
                                   :headers (spotify--token-headers)
-                                  :params `((volume_percent ,(number-to-string volume-percent))))))
+                                  :params `((volume_percent ,volume-percent)))))
     (spotify--error-check response)))
+
+(defun spotify-search ()
+  "Open the Spotify Search buffer."
+  (interactive)
+  (switch-to-buffer "*Spotify Search*")
+  (kill-all-local-variables)
+  (let ((inhibit-read-only t))
+    (erase-buffer))
+  (remove-overlays)
+  (widget-insert (propertize "Spotify Search:\n\n" 'face 'bold))
+  (setq-local spotify--search-types-widget
+              (widget-create 'checklist
+                             :format "Types:\n%v"
+                             :entry-format " - %b %v"
+                             :value '(album artist playlist track)
+                             '(item :tag "Album" album)
+                             '(item :tag "Artist" artist)
+                             '(item :tag "Audiobook" audiobook)
+                             '(item :tag "Episode" episode)
+                             '(item :tag "Playlist" playlist)
+                             '(item :tag "Track" track)
+                             '(item :tag "Show" show)))
+  (widget-insert "\n")
+  (setq-local spotify--search-query-widget
+              (widget-create 'editable-field
+                             :size 40
+                             :format "Query: %v "))
+  (widget-create 'push-button
+                 :notify (lambda (_widget &rest _ignore)
+                           (let ((query (widget-value spotify--search-query-widget))
+                                 (type  (widget-value spotify--search-types-widget)))
+                             (if (not type)
+                                 (signal 'spotify--error '("At least one type must be specified.")))
+                             (let ((response (spotify--fetch "api.spotify.com/v1/search"
+                                                             :method "GET"
+                                                             :headers (spotify--token-headers)
+                                                             :params `((q    ,query)
+                                                                       (type ,(mapconcat #'symbol-name type ","))))))
+                               (spotify--error-check response)
+                               (mapc #'widget-delete (widget-get spotify--search-results-widget :children))
+                               (save-excursion
+                                 (goto-char (point-max))
+                                 (widget-create-child spotify--search-results-widget '(checkbox))))))
+                 "Submit")
+  (widget-insert "\n\n")
+  (setq-local spotify--search-results-widget
+              (widget-create 'group
+                             :format "Results:\n%v"))
+  (use-local-map widget-keymap)
+  (widget-setup)
+  (goto-char (overlay-start (widget-get spotify--search-query-widget :field-overlay))))
 
 (provide 'spotify)
 ;;; spotify.el ends here
+
