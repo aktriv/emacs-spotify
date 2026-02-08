@@ -8,7 +8,7 @@
 ;; Created: 9 Aug 2020
 ;; Keywords: hypermedia
 ;; Package-Requires: ((emacs "29.1"))
-;; Homepage: https://github.com/SnootierMoon/emacs-spotify
+;; Homepage: https://github.com/aktriv/emacs-spotify
 
 ;; This file is not part of GNU Emacs.
 

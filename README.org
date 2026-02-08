@@ -15,7 +15,7 @@ built-in on Emacs 30.
 #+begin_src emacs-lisp
 (use-package spotify
   :vc (emacs-spotify
-       :url "https://github.com/SnootierMoon/emacs-spotify"))
+       :url "https://github.com/aktriv/emacs-spotify"))
 #+end_src
 
 ** Usage
